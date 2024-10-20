@@ -11,6 +11,7 @@ import { Domain, Service } from './types';
 import { getMessageTypeUtils } from './utils/catalog-shorthand';
 import { OpenAPI } from 'openapi-types';
 import checkLicense from './utils/checkLicense';
+import * as semver from 'semver';
 
 type Props = {
   services: Service[];
@@ -53,9 +54,11 @@ export default async (_: any, options: Props) => {
     const version = document.info.version;
 
     const service = buildService(serviceSpec, document);
-    let serviceMarkdown = service.markdown;
-    let serviceSpecificationsFiles = [];
-    let serviceSpecifications = service.specifications;
+    let serviceCatalogPath = service.id;
+    let markdown = service.markdown;
+    let specFiles = [];
+    let specifications = service.specifications;
+    let { sends, receives } = await processMessagesForOpenAPISpec(serviceSpec.path, document);
 
     // Manage domain
     if (options.domain) {
@@ -91,64 +94,66 @@ export default async (_: any, options: Props) => {
       await addServiceToDomain(domainId, { id: service.id, version: service.version }, domainVersion);
     }
 
-    // Process all messages for the OpenAPI spec
-    let { sends, receives } = await processMessagesForOpenAPISpec(serviceSpec.path, document);
-
     // Check if service is already defined... if the versions do not match then create service.
     const latestServiceInCatalog = await getService(service.id, 'latest');
+    const existingVersionInCatalog = await getService(service.id, version);
+
     console.log(chalk.blue(`Processing service: ${document.info.title} (v${version})`));
 
+    // Found a service, and versions do not match, we need to version the one already there
     if (latestServiceInCatalog) {
-      serviceMarkdown = latestServiceInCatalog.markdown;
-      serviceSpecificationsFiles = await getSpecificationFilesForService(service.id, 'latest');
-      sends = latestServiceInCatalog.sends || ([] as any);
-
-      // persist any specifications that are already in the catalog
-      serviceSpecifications = {
-        ...serviceSpecifications,
-        ...latestServiceInCatalog.specifications,
-      };
-
-      // Found a service, and versions do not match, we need to version the one already there
-      if (latestServiceInCatalog.version !== version) {
+      if (isHigherVersion(version, latestServiceInCatalog.version)) {
         await versionService(service.id);
         console.log(chalk.cyan(` - Versioned previous service (v${latestServiceInCatalog.version})`));
+      } else {
+        serviceCatalogPath = serviceCatalogPath.concat(`/versioned/${version}`);
+        console.log(chalk.yellow(` - Service (v${latestServiceInCatalog.version}) already exists, skipped creation...`));
       }
+    }
+
+    if (existingVersionInCatalog) {
+      markdown = existingVersionInCatalog.markdown;
+      specFiles = await getSpecificationFilesForService(service.id, version);
+      sends = existingVersionInCatalog.sends || ([] as any);
+      receives = [...(existingVersionInCatalog.receives ?? []), ...receives];
+
+      // persist any specifications that are already in the catalog
+      specifications = {
+        ...specifications,
+        ...existingVersionInCatalog.specifications,
+      };
 
       // Match found, override it
-      if (latestServiceInCatalog.version === version) {
-        receives = latestServiceInCatalog.receives ? [...latestServiceInCatalog.receives, ...receives] : receives;
-        await rmServiceById(service.id);
-      }
+      await rmServiceById(service.id, version);
     }
 
     await writeService(
       {
         ...service,
-        markdown: serviceMarkdown,
-        specifications: serviceSpecifications,
+        markdown: markdown,
+        specifications: specifications,
         sends,
         receives,
       },
-      { path: service.id }
+      { path: serviceCatalogPath }
     );
 
     // What files need added to the service (speficiation files)
-    const specFiles = [
+    const existingSpecFiles = [
       // add any previous spec files to the list
-      ...serviceSpecificationsFiles,
+      ...specFiles,
       {
         content: openAPIFile,
         fileName: service.schemaPath,
       },
     ];
 
-    for (const specFile of specFiles) {
+    for (const spec of existingSpecFiles) {
       await addFileToService(
         service.id,
         {
-          fileName: specFile.fileName,
-          content: specFile.content,
+          fileName: spec.fileName,
+          content: spec.content,
         },
         version
       );
@@ -235,3 +240,6 @@ const processMessagesForOpenAPISpec = async (pathToSpec: string, document: OpenA
   }
   return { receives, sends: [] };
 };
+function isHigherVersion(sourceVersion: string, targetVersion: string) {
+  return semver.gt(sourceVersion, targetVersion);
+}
